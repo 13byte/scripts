@@ -25,10 +25,7 @@ echo "[@] 순회:"
 for file in "${FILE_EXTENSIONS[@]}"; do
     echo "항목: $file"
 done
-
 echo "-----------------------------------"
-
-# [*] 사용
 echo "[*] 순회:"
 for file in "${FILE_EXTENSIONS[*]}"; do
     echo "항목: $file"
