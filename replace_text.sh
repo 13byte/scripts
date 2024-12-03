@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 스크립트 이름 가져오기 (확장자 제외)
-SCRIPT_NAME=$0
+SCRIPT_NAME=$(basename "$0" .sh)
 
 # 로그 디렉토리 및 파일 설정
 LOG_DIR="./script_logs"
@@ -14,8 +14,8 @@ TEMP_DIR="/tmp/replace_temp"
 FILE_EXTENSIONS=("ini")
 
 # 변경할 텍스트 정의
-OLD_TEXT='oldText'
-NEW_TEXT='newText'
+OLD_TEXT='test'
+NEW_TEXT='Tomorrow'
 
 # 로그 디렉토리 생성 함수
 setup_logging() {
@@ -82,6 +82,7 @@ show_progress() {
         "$(printf '#%.0s' $(seq 1 $completed))" \
         "$(printf ' %.0s' $(seq 1 $remaining))" \
         "$percent"
+    echo ""
 }
 
 # 파일 미리보기 함수
@@ -169,7 +170,9 @@ main() {
     local files=()
     local total_files=0
     local modified_files=0
-    
+
+    setup_logging
+
     log "Starting directory: $(pwd)"
     log "Processing files with extensions: ${FILE_EXTENSIONS[*]}"
     
