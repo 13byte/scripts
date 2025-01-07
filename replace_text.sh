@@ -36,11 +36,11 @@ setup_logging() {
     fi
 
     echo "Log file created: $LOG_FILE"
-    echo "----------------------------------------" >> "$LOG_FILE"
-    echo "Script started at: $(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG_FILE"
-    echo "Working directory: $(pwd)" >> "$LOG_FILE"
-    echo "Target extensions: ${FILE_EXTENSIONS[*]}" >> "$LOG_FILE"
-    echo "----------------------------------------" >> "$LOG_FILE"
+    echo "----------------------------------------" >>"$LOG_FILE"
+    echo "Script started at: $(date '+%Y-%m-%d %H:%M:%S')" >>"$LOG_FILE"
+    echo "Working directory: $(pwd)" >>"$LOG_FILE"
+    echo "Target extensions: ${FILE_EXTENSIONS[*]}" >>"$LOG_FILE"
+    echo "----------------------------------------" >>"$LOG_FILE"
 }
 
 # 로그 함수
@@ -51,7 +51,7 @@ log() {
 
 # 로그 정리 함수
 cleanup_old_logs() {
-    local max_logs=50  # 보관할 최대 로그 파일 수
+    local max_logs=50 # 보관할 최대 로그 파일 수
     local log_count=$(ls -1 "$LOG_DIR"/*_${SCRIPT_NAME}.log 2>/dev/null | wc -l)
 
     if [ "$log_count" -gt "$max_logs" ]; then
@@ -77,7 +77,7 @@ show_progress() {
     percent=$((current * 100 / total))
     completed=$((percent / 2))
     remaining=$((50 - completed))
-    
+
     printf "\rProgress: [%-${completed}s%-${remaining}s] %d%%" \
         "$(printf '#%.0s' $(seq 1 $completed))" \
         "$(printf ' %.0s' $(seq 1 $remaining))" \
@@ -90,7 +90,7 @@ preview_file() {
     local file="$1"
     local changes=0
     local line_num=0
-    
+
     while IFS= read -r line; do
         ((line_num++))
         if [[ "$line" == *"$OLD_TEXT"* ]]; then
@@ -100,8 +100,8 @@ preview_file() {
             echo "    After:  ${line//$OLD_TEXT/$NEW_TEXT}"
             ((changes++))
         fi
-    done < "$file"
-    
+    done <"$file"
+
     return $changes
 }
 
@@ -123,43 +123,43 @@ process_file() {
     local preview_only="$2"
     local temp_file="$TEMP_DIR/$(basename "$file").tmp"
     local backup_file="${file}.bak"
-    
+
     # 확장자 검사
     check_extension "$file" || return 0
-    
+
     # 미리보기 모드
     if [[ "$preview_only" == "true" ]]; then
         preview_file "$file"
         return $?
     fi
-    
+
     # 원본 해시 계산
     local original_hash=$(calculate_hash "$file")
-    
+
     # 임시 디렉토리 생성
     mkdir -p "$TEMP_DIR"
-    
+
     # 파일 변경
-    sed "s|$OLD_TEXT|$NEW_TEXT|g" "$file" > "$temp_file"
-    
+    sed "s|$OLD_TEXT|$NEW_TEXT|g" "$file" >"$temp_file"
+
     # 변경사항이 있는지 확인
     if ! cmp -s "$file" "$temp_file"; then
         # 백업 생성
         cp "$file" "$backup_file"
-        
+
         # 파일 교체
         mv "$temp_file" "$file"
-        
+
         # 새 해시 계산
         local new_hash=$(calculate_hash "$file")
-        
+
         log "File modified: $file"
         log "Original hash: $original_hash"
         log "New hash: $new_hash"
-        
+
         return 1
     fi
-    
+
     rm -f "$temp_file"
     return 0
 }
@@ -175,38 +175,38 @@ main() {
 
     log "Starting directory: $(pwd)"
     log "Processing files with extensions: ${FILE_EXTENSIONS[*]}"
-    
+
     # 지정된 확장자의 파일들 찾기
     local find_pattern=""
     for ext in "${FILE_EXTENSIONS[@]}"; do
         find_pattern="$find_pattern -o -name \"*.$ext\""
     done
     find_pattern="${find_pattern:4}" # 첫 "-o" 제거
-    
+
     while IFS= read -r -d '' file; do
         files+=("$file")
         ((total_files++))
     done < <(eval "find . -type f \( $find_pattern \) -print0")
-    
+
     log "Total files found: $total_files"
-    
+
     if [[ "$preview_only" == "true" ]]; then
         echo "Preview mode - showing potential changes:"
         echo "----------------------------------------"
     fi
-    
+
     # 파일 처리
     local current=0
     for file in "${files[@]}"; do
         ((current++))
         show_progress $current $total_files
-        
+
         if process_file "$file" "$preview_only"; then
             ((modified_files++))
         fi
     done
     echo
-    
+
     # 결과 출력
     if [[ "$preview_only" == "true" ]]; then
         echo "Preview completed. $modified_files files will be modified."
@@ -223,7 +223,7 @@ main() {
         echo "Operation completed: $modified_files files modified"
         echo "Check $LOG_FILE for details"
     fi
-    
+
     # 임시 디렉토리 정리
     rm -rf "$TEMP_DIR"
 }
