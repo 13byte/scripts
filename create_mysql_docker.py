@@ -64,7 +64,7 @@ def select_version(versions):
        except ValueError:
            print("올바른 숫자를 입력하세요.")
        except Exception as e:
-           print(f"오류 발생: {str(e)}")
+           print(f"\n오류 발생: {str(e)}")
        
        attempts += 1
        if attempts == max_attempts:
