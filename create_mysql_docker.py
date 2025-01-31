@@ -83,7 +83,6 @@ services:
     container_name: {container_name}
     volumes:
       - {current_dir}/mysql_data:/var/lib/mysql
-      - {current_dir}/con:/root/con
     ports:
       - "3306:3306"
 """
@@ -100,7 +99,6 @@ def main():
    
    try:
        os.makedirs("mysql_data", exist_ok=True)
-       os.makedirs("con", exist_ok=True)
        versions = display_versions()
        version = select_version(versions)
        
