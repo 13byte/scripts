@@ -2,16 +2,11 @@
 import os
 import signal
 import time
+import re
 
 def signal_handler(sig, frame):
    print('\n\n프로그램을 안전하게 종료합니다.')
    exit(0)
-
-def check_cnf_exists():
-   if not os.path.exists('cnf/my.cnf'):
-       print("\n/cnf/my.cnf가 없습니다.")
-       exit(1)
-   return True
 
 def generate_versions():
    v5 = [
@@ -98,6 +93,33 @@ def select_version(versions):
            print("최대 시도 횟수를 초과했습니다.")
            return None
 
+def check_cnf_exists():
+   if not os.path.exists('cnf/my.cnf'):
+       print("\n/cnf/my.cnf가 없습니다.")
+       exit(1)
+   return True
+
+def modify_cnf(version):
+   try:
+       with open('cnf/my.cnf', 'r') as f:
+           content = f.read()
+
+       # socket 경로를 버전에 맞게 수정
+       socket_path = '/var/run/mysqld/mysqld.sock' if version.startswith('5.6') else '/var/lib/mysql/mysql.sock'
+       
+       # [mysqld] 섹션의 socket 경로 수정
+       content = re.sub(r'(socket\s*=\s*)/[^\n]*', r'\1' + socket_path, content)
+       
+       # 수정된 내용 저장
+       with open('cnf/my.cnf', 'w') as f:
+           f.write(content)
+           
+       return True
+
+   except Exception as e:
+       print(f"my.cnf 수정 중 오류 발생: {str(e)}")
+       return False
+
 def create_docker_compose(version):
    try:
        container_name = f"mysql_{version.replace('.', '_')}"
@@ -134,14 +156,16 @@ def main():
        versions = display_versions()
        version = select_version(versions)
        
-       if version and create_docker_compose(version):
-           print("\n설정 완료")
-           print("\n실행 방법:")
-           print("1. docker compose up -d")
-           container_name = f"mysql_{version.replace('.', '_')}"
-           print(f"2. docker container exec -it {container_name} bash")
-           print("\n문의: jw.song@iunetworks.com")
-           print("\n")
+       if version:
+           modify_cnf(version)
+           if create_docker_compose(version):
+               print("\n설정 완료")
+               print("\n실행 방법:")
+               print("1. docker compose up -d")
+               container_name = f"mysql_{version.replace('.', '_')}"
+               print(f"2. docker container exec -it {container_name} bash")
+               print("\n문의: jw.song@iunetworks.com")
+               print("\n")
            
    except Exception as e:
        print(f"실행 중 오류 발생: {str(e)}")
