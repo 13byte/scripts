@@ -107,7 +107,7 @@ class BackupManager:
         self.container_name = container_name
         self.date_str = datetime.now().strftime("%Y%m%d")
 
-    def get_backup_target(self) -> Optional[Tuple[str, str, str]]:
+    def get_backup_target(self) -> Optional[Tuple[str, str, str, str]]:
         """백업 대상과 비밀번호 입력 받기"""
         try:
             print("\n백업 대상을 입력하세요.")
@@ -118,18 +118,23 @@ class BackupManager:
                 print("입력값이 없습니다.")
                 return None
 
+            print("\nmysqldump 추가 인자를 입력하세요 (공백 포함)")
+            print("예시: --single-transaction --quick --no-create-info")
+            print("입력하지 않으려면 Enter를 누르세요")
+            extra_args = input("입력: ").strip()
+
             password = input("\nMySQL root 비밀번호를 입력하세요: ").strip()
 
             if "." in target:
                 db, table = target.split(".")
-                return (db, table, password)
-            return (target, None, password)
+                return (db, table, password, extra_args)
+            return (target, None, password, extra_args)
 
         except Exception as e:
             raise MySQLConfigError(f"백업 대상 입력 중 오류 발생: {str(e)}")
 
     def execute_backup(
-        self, db: str, password: str, table: Optional[str] = None
+        self, db: str, password: str, extra_args: str = "", table: Optional[str] = None
     ) -> bool:
         """백업 실행"""
         try:
@@ -150,7 +155,8 @@ class BackupManager:
             local_backup_path = os.path.join(sql_dir, backup_file)
 
             print(f"\n{backup_target} 백업 중...")
-            dump_cmd = f"mysqldump -u {CONSTANTS['MYSQL_USER']} -p'{password}' {backup_target} > {container_backup_path}"
+            # mysqldump 명령어에 추가 인자 포함
+            dump_cmd = f"mysqldump -u {CONSTANTS['MYSQL_USER']} -p'{password}' {extra_args} {backup_target} > {container_backup_path}"
             exec_cmd = [
                 "docker",
                 "container",
@@ -414,8 +420,8 @@ def main():
                 backup_info = backup_manager.get_backup_target()
 
                 if backup_info:
-                    db, table, password = backup_info
-                    backup_manager.execute_backup(db, password, table)
+                    db, table, password, extra_args = backup_info
+                    backup_manager.execute_backup(db, password, extra_args, table)
 
                 print("\n모든 작업이 완료되었습니다.")
 
