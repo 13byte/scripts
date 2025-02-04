@@ -10,9 +10,7 @@ from typing import List, Dict, Tuple, Optional
 # 상수 정의
 CONSTANTS = {
     "MAX_ATTEMPTS": 3,
-    "DEFAULT_SOCKET_PATH": "/var/lib/mysql/mysql.sock",
-    "V56_SOCKET_PATH": "/var/run/mysqld/mysqld.sock",
-    "CNF_PATH": "cnf/my.cnf",
+    "CNF_PATH": "cnf/my.cnf",  # 원본 서버의 설정 파일 경로
     "DATA_DIR": "data",
     "SQL_DIR": "sql",
     "MYSQL_USER": "root",
@@ -35,25 +33,31 @@ class ConfigManager:
     def check_exists(self) -> bool:
         """설정 파일 존재 여부 확인"""
         if not os.path.exists(self.cnf_path):
-            raise MySQLConfigError(f"{self.cnf_path}가 없습니다.")
+            raise MySQLConfigError(
+                f"복원에 필요한 MySQL 설정 파일({self.cnf_path})이 없습니다.\n"
+                f"원본 서버의 설정 파일을 {self.cnf_path} 경로에 복사해주세요."
+            )
         return True
 
     def modify_socket_path(self, version: str) -> bool:
         """버전에 따른 소켓 경로 수정"""
         try:
             content = self._read_config()
-            socket_path = (
-                CONSTANTS["V56_SOCKET_PATH"]
-                if version.startswith("5.6")
-                else CONSTANTS["DEFAULT_SOCKET_PATH"]
-            )
-            modified_content = re.sub(
-                r"(socket\s*=\s*)/[^\n]*", r"\1" + socket_path, content
-            )
-            self._write_config(modified_content)
+
+            # 5.6 버전의 경우 소켓 경로를 수정
+            if version.startswith("5.6"):
+                socket_path = "/var/run/mysqld/mysqld.sock"
+                modified_content = re.sub(
+                    r"(socket\s*=\s*)/[^\n]*", r"\1" + socket_path, content
+                )
+                self._write_config(modified_content)
+                print(
+                    f"MySQL {version} 버전에 맞게 소켓 경로를 {socket_path}로 수정했습니다."
+                )
+
             return True
         except Exception as e:
-            raise MySQLConfigError(f"my.cnf 수정 중 오류 발생: {str(e)}")
+            raise MySQLConfigError(f"설정 파일 수정 중 오류 발생: {str(e)}")
 
     def _read_config(self) -> str:
         """설정 파일 읽기"""
@@ -93,10 +97,12 @@ services:
     container_name: {self.container_name}
     volumes:
       - {self.current_dir}/{CONSTANTS['DATA_DIR']}:/var/lib/mysql
-      - {self.current_dir}/{CONSTANTS['CNF_PATH']}:/etc/my.cnf
+      - {self.current_dir}/{CONSTANTS['CNF_PATH']}:/etc/my.cnf:ro
     ports:
       - "3306:3306"
     command: --defaults-file=/etc/my.cnf
+    environment:
+      - MYSQL_ALLOW_EMPTY_PASSWORD=yes
 """
 
 
@@ -107,7 +113,7 @@ class BackupManager:
         self.container_name = container_name
         self.date_str = datetime.now().strftime("%Y%m%d")
 
-    def get_backup_target(self) -> Optional[Tuple[str, str, str, str]]:
+    def get_backup_target(self) -> Optional[Tuple[str, str, str]]:
         """백업 대상과 비밀번호 입력 받기"""
         try:
             print("\n백업 대상을 입력하세요.")
@@ -118,27 +124,21 @@ class BackupManager:
                 print("입력값이 없습니다.")
                 return None
 
-            print("\nmysqldump 추가 인자를 입력하세요 (공백 포함)")
-            print("예시: --single-transaction --quick --no-create-info")
-            print("입력하지 않으려면 Enter를 누르세요")
-            extra_args = input("입력: ").strip()
-
             password = input("\nMySQL root 비밀번호를 입력하세요: ").strip()
 
             if "." in target:
                 db, table = target.split(".")
-                return (db, table, password, extra_args)
-            return (target, None, password, extra_args)
+                return (db, table, password)
+            return (target, None, password)
 
         except Exception as e:
             raise MySQLConfigError(f"백업 대상 입력 중 오류 발생: {str(e)}")
 
     def execute_backup(
-        self, db: str, password: str, extra_args: str = "", table: Optional[str] = None
+        self, db: str, password: str, table: Optional[str] = None
     ) -> bool:
         """백업 실행"""
         try:
-            # SQL 디렉토리 생성
             sql_dir = os.path.join(os.getcwd(), CONSTANTS["SQL_DIR"])
             os.makedirs(sql_dir, exist_ok=True)
 
@@ -148,15 +148,13 @@ class BackupManager:
             print("MySQL 서버 준비 대기 중...")
             time.sleep(10)
 
-            # 백업 파일 경로 설정
             backup_target = f"{db}.{table}" if table else db
             backup_file = f"{self.date_str}_{backup_target.replace('.', '_')}.sql"
             container_backup_path = f"{CONSTANTS['BACKUP_DIR']}/{backup_file}"
             local_backup_path = os.path.join(sql_dir, backup_file)
 
             print(f"\n{backup_target} 백업 중...")
-            # mysqldump 명령어에 추가 인자 포함
-            dump_cmd = f"mysqldump -u {CONSTANTS['MYSQL_USER']} -p'{password}' {extra_args} {backup_target} > {container_backup_path}"
+            dump_cmd = f"mysqldump -u {CONSTANTS['MYSQL_USER']} -p'{password}' {backup_target} > {container_backup_path}"
             exec_cmd = [
                 "docker",
                 "container",
@@ -167,7 +165,6 @@ class BackupManager:
                 dump_cmd,
             ]
 
-            # mysqldump 실행 (capture_output 대신 PIPE 사용)
             process = subprocess.Popen(
                 exec_cmd,
                 stdout=subprocess.PIPE,
@@ -181,7 +178,6 @@ class BackupManager:
                     raise MySQLConfigError("MySQL 비밀번호가 올바르지 않습니다.")
                 raise MySQLConfigError(f"mysqldump 실행 중 오류: {stderr}")
 
-            # 컨테이너에서 로컬로 파일 복사
             cp_cmd = f"docker cp {self.container_name}:{container_backup_path} {local_backup_path}"
             subprocess.run(cp_cmd, shell=True, check=True)
 
@@ -200,10 +196,8 @@ class BackupManager:
 class VersionManager:
     """MySQL 버전 관리 클래스"""
 
-    @staticmethod
-    def generate_versions() -> Tuple[List[str], ...]:
-        """지원되는 MySQL 버전 목록 생성"""
-        v5 = [
+    MYSQL_VERSIONS = {
+        "5.6": [
             "5.6.17",
             "5.6.20",
             "5.6.21",
@@ -237,9 +231,8 @@ class VersionManager:
             "5.6.49",
             "5.6.50",
             "5.6.51",
-        ]
-
-        v7 = [
+        ],
+        "5.7": [
             "5.7.4",
             "5.7.5",
             "5.7.6",
@@ -281,9 +274,8 @@ class VersionManager:
             "5.7.42",
             "5.7.43",
             "5.7.44",
-        ]
-
-        v8 = [
+        ],
+        "8.0": [
             "8.0.0",
             "8.0.1",
             "8.0.2",
@@ -320,36 +312,39 @@ class VersionManager:
             "8.0.39",
             "8.0.40",
             "8.0.41",
-        ]
-
-        return (v5, v7, v8)
+        ],
+    }
 
     @staticmethod
     def display_versions() -> List[str]:
         """버전 목록 표시"""
         try:
-            v5, v7, v8 = VersionManager.generate_versions()
-            max_len = max(len(v5), len(v7), len(v8))
+            all_versions = []
+            version_count = 1
 
             print("\nMySQL 버전 선택:")
-            print("=" * 80)
-            fmt = "{:<20}{:<20}{:<20}"
-            print(fmt.format("5.6.x", "5.7.x", "8.0.x"))
-            print("-" * 80)
+            print("=" * 120)
 
-            for i in range(0, max_len, 3):
-                rows = []
-                for j in range(3):
-                    idx = i + j
-                    v5_str = f"{idx+1}. {v5[idx]}" if idx < len(v5) else ""
-                    v7_str = f"{len(v5)+idx+1}. {v7[idx]}" if idx < len(v7) else ""
-                    v8_str = (
-                        f"{len(v5)+len(v7)+idx+1}. {v8[idx]}" if idx < len(v8) else ""
-                    )
-                    rows.append(fmt.format(v5_str, v7_str, v8_str))
-                print("\n".join(rows))
+            for major_version, versions in VersionManager.MYSQL_VERSIONS.items():
+                if versions:  # 버전이 있는 그룹만 표시
+                    print(f"\n{major_version}.x:")
+                    print("-" * 120)
 
-            return v5 + v7 + v8
+                    current_line = []
+                    for version in versions:
+                        all_versions.append(version)
+                        current_line.append(f"{version_count:3d}. {version:12}")
+                        version_count += 1
+
+                        if len(current_line) == 5:  # 한 줄에 5개씩 표시
+                            print("".join(current_line))
+                            current_line = []
+
+                    if current_line:  # 마지막 줄 출력
+                        print("".join(current_line))
+
+            return all_versions
+
         except Exception as e:
             raise MySQLConfigError(f"버전 표시 중 오류 발생: {str(e)}")
 
@@ -408,7 +403,7 @@ def main():
         version = VersionManager.select_version(versions)
 
         if version:
-            # 설정 파일 수정
+            # 버전에 따른 설정 파일 수정
             config_manager.modify_socket_path(version)
 
             # Docker Compose 설정 생성
@@ -420,8 +415,8 @@ def main():
                 backup_info = backup_manager.get_backup_target()
 
                 if backup_info:
-                    db, table, password, extra_args = backup_info
-                    backup_manager.execute_backup(db, password, extra_args, table)
+                    db, table, password = backup_info
+                    backup_manager.execute_backup(db, password, table)
 
                 print("\n모든 작업이 완료되었습니다.")
 
