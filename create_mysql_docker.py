@@ -57,7 +57,8 @@ class DockerContainerBase:
             subprocess.run(["docker", "compose", "up", "-d"], check=True)
             return True
         except Exception as e:
-            cleanup_docker()  # 오류 발생 시 정리
+            # 시작 실패 시에만 cleanup 실행
+            cleanup_docker()
             raise MySQLConfigError(f"컨테이너 시작 중 오류 발생: {str(e)}")
 
     def stop_container(self) -> bool:
@@ -129,19 +130,32 @@ class ConfigManager:
         """버전에 따른 소켓 경로 수정"""
         try:
             content = self._read_config()
-            socket_path = (
-                Constants.V56_SOCKET_PATH
-                if version.startswith("5.6")
-                else Constants.DEFAULT_SOCKET_PATH
-            )
-            modified_content = re.sub(
-                r"(socket\s*=\s*)/[^\n]*", r"\1" + socket_path, content
-            )
-            self._write_config(modified_content)
-            print(
-                f"MySQL {version} 버전에 맞게 소켓 경로를 {socket_path}로 수정했습니다."
-            )
-            return True
+            # 버전 확인 로직
+            version_parts = version.split(".")
+            if len(version_parts) >= 2:
+                version_num = float(f"{version_parts[0]}.{version_parts[1]}")
+                sub_version = float(version_parts[2]) if len(version_parts) > 2 else 0
+
+                need_old_socket = (
+                    version.startswith("5.6")
+                    or (version_num == 5.7 and sub_version <= 36)
+                    or (version_num == 8.0 and sub_version <= 28)
+                )
+
+                socket_path = (
+                    Constants.V56_SOCKET_PATH
+                    if need_old_socket
+                    else Constants.DEFAULT_SOCKET_PATH
+                )
+
+                modified_content = re.sub(
+                    r"(socket\s*=\s*)/[^\n]*", r"\1" + socket_path, content
+                )
+                self._write_config(modified_content)
+                print(
+                    f"MySQL {version} 버전에 맞게 소켓 경로를 {socket_path}로 수정했습니다."
+                )
+                return True
         except Exception as e:
             raise MySQLConfigError(f"my.cnf 수정 중 오류 발생: {str(e)}")
 
@@ -168,6 +182,7 @@ class DockerComposeManager:
         """Docker Compose 설정 파일 생성"""
         try:
             config = self._generate_config()
+            print(f"\nDocker Compose 설정 파일 생성 중... (MySQL 버전: {self.version})")
             with open("docker-compose.yml", "w") as f:
                 f.write(config)
             return True
@@ -176,17 +191,29 @@ class DockerComposeManager:
 
     def _generate_config(self) -> str:
         """Docker Compose 설정 생성"""
+        version_parts = self.version.split(".")
+
+        # 8.0.15 이하 버전에만 secure-file-priv 옵션 추가
+        if (
+            version_parts[0] == "8"
+            and version_parts[1] == "0"
+            and float(version_parts[2]) <= 28
+        ):
+            secure_option = " --secure-file-priv=''"
+        else:
+            secure_option = ""
+
         return f"""services:
-  {self.container_name}:
-    image: mysql:{self.version}
-    container_name: {self.container_name}
-    volumes:
-      - {self.current_dir}/{Constants.DATA_DIR}:/var/lib/mysql
-      - {self.current_dir}/{Constants.CNF_PATH}:/etc/my.cnf:ro
-    ports:
-      - "3306:3306"
-    command: --defaults-file=/etc/my.cnf
-"""
+        {self.container_name}:
+            image: mysql:{self.version}
+            container_name: {self.container_name}
+            volumes:
+            - {self.current_dir}/{Constants.DATA_DIR}:/var/lib/mysql
+            - {self.current_dir}/{Constants.CNF_PATH}:/etc/my.cnf:ro
+            ports:
+            - "3306:3306"
+            command: --defaults-file=/etc/my.cnf{secure_option}
+    """
 
 
 class BackupManager(DockerContainerBase):
@@ -391,28 +418,37 @@ class VersionUpgradeManager(DockerContainerBase):
                     self._upgrade_with_mysql_upgrade(password)
                 elif source_version == "5.7" and target_version.startswith("8.0"):
                     print(f"\n5.7 -> {target_version} 업그레이드 진행 중...")
-                    print("8.0 자동 업그레이드가 진행됩니다. 잠시만 기다려주세요...")
-                    self.start_container()
-                    self.wait_for_mysql_ready(password=password)
+                    version_parts = target_version.split(".")
+                    if len(version_parts) >= 3 and float(version_parts[2]) <= 15:
+                        print(
+                            "8.0.15 이하 버전으로 업그레이드 시 mysql_upgrade가 필요합니다..."
+                        )
+                        self.start_container()
+                        self.wait_for_mysql_ready(password=password)
+                        self._run_mysql_upgrade(password)
+                    else:
+                        print("8.0.16 이상 버전은 자동 업그레이드가 진행됩니다...")
+                        self.start_container()
+                        self.wait_for_mysql_ready(password=password)
 
                 self.stop_container()
                 return True
 
             except Exception as e:
-                self.stop_container()  # 오류 발생 시에도 정리
+                self.stop_container()
                 raise MySQLConfigError(f"업그레이드 실행 중 오류 발생: {str(e)}")
 
         except Exception as e:
-            cleanup_docker()  # 최상위 오류 발생 시에도 정리
+            cleanup_docker()
             raise MySQLConfigError(f"업그레이드 실행 중 오류 발생: {str(e)}")
 
     def _upgrade_56_to_80(self, target_version: str, password: str) -> None:
         """5.6에서 8.0으로 업그레이드"""
         try:
+            # 1. 5.7 버전으로 중간 업그레이드
             print("\n===== 5.6 -> 8.0 업그레이드 1단계 =====")
             print(f"5.6 -> 5.7.44 버전으로 업그레이드를 진행합니다...")
 
-            # 1. 5.7 버전으로 중간 업그레이드
             docker_manager = DockerComposeManager("5.7.44")
             docker_manager.create_config()
 
@@ -421,19 +457,28 @@ class VersionUpgradeManager(DockerContainerBase):
             self._run_mysql_upgrade(password)
             self.stop_container()
 
+            # 2. 8.0 버전으로 최종 업그레이드
             print("\n===== 5.6 -> 8.0 업그레이드 2단계 =====")
             print(f"5.7.44 -> {target_version} 버전으로 업그레이드를 진행합니다...")
-            print(
-                "8.0 자동 업그레이드가 진행됩니다. 이 작업은 시간이 걸릴 수 있습니다..."
-            )
 
-            # 2. 8.0 버전으로 최종 업그레이드
+            version_parts = target_version.split(".")
+            if len(version_parts) >= 3 and float(version_parts[2]) <= 15:
+                print(
+                    "8.0.15 이하 버전으로 업그레이드 시 mysql_upgrade가 필요합니다..."
+                )
+            else:
+                print("8.0.16 이상 버전은 자동 업그레이드가 진행됩니다...")
+
             docker_manager = DockerComposeManager(target_version)
             docker_manager.create_config()
 
             self.start_container()
             self.wait_for_mysql_ready(password=password)
-            print(f"\n{target_version} 버전으로 업그레이드가 완료되었습니다.")
+
+            # 8.0.15 이하 버전인 경우 mysql_upgrade 실행
+            if len(version_parts) >= 3 and float(version_parts[2]) <= 15:
+                self._run_mysql_upgrade(password)
+
         except Exception as e:
             self.stop_container()
             raise MySQLConfigError(f"5.6 -> 8.0 업그레이드 중 오류 발생: {str(e)}")
@@ -685,6 +730,9 @@ def main():
         target_version = VersionManager.select_version(versions)
 
         if target_version:
+            # 버전별 소켓 경로 수정
+            config_manager.modify_socket_path(target_version)
+
             # Docker Compose 설정 생성
             docker_manager = DockerComposeManager(target_version)
             docker_manager.create_config()
@@ -712,13 +760,10 @@ def main():
                 source_version = upgrade_manager.get_source_version()
                 target_version_major = ".".join(target_version.split(".")[:2])
 
-                # 소켓 경로 수정
-                config_manager.modify_socket_path(target_version)
-
                 # 버전이 다른 경우 업그레이드 진행
                 if source_version != target_version_major:
                     print(
-                        f"\n버전 업그레이드가 필요합니다. ({source_version} -> {target_version_major})"
+                        f"\n버전 업그레이드가 필요합니다. ({source_version} -> {target_version})"
                     )
                     upgrade_path = [source_version, target_version]
                     print(f"업그레이드 경로: {' -> '.join(upgrade_path)}")
