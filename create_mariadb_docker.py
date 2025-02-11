@@ -352,7 +352,7 @@ class BackupManager(DockerContainerBase):
     ) -> None:
         """백업 실행"""
         dump_cmd = self.mariadb_cmd.get_mariadbdump_command(
-            Constants.MYSQL_USER, password, backup_target, backup_path
+            Constants.MARIADB_USER, password, backup_target, backup_path
         )
         exec_cmd = [
             "docker",
