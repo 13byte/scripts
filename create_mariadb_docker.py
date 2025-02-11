@@ -2,9 +2,9 @@
 import os
 import signal
 import subprocess
-import glob
+import time
 import re
-import sys
+from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 
 
@@ -21,10 +21,13 @@ class Constants:
     DEFAULT_SOCKET_PATH = "/var/lib/mysql/mysql.sock"
     OLD_SOCKET_PATH = "/var/run/mysqld/mysqld.sock"
     CNF_DIR = "cnf"  # 기본 설정 디렉토리
+    MARIADB_USER = "root"
     MY_CNF = os.path.join(CNF_DIR, "my.cnf")  # my.cnf 파일
     MYCNF_D_DIR = os.path.join(CNF_DIR, "my.cnf.d")  # my.cnf.d 디렉토리
     MYSQL_CNF_DIR = os.path.join(CNF_DIR, "mysql")  # mysql 디렉토리
+    SQL_DIR = "sql"
     DATA_DIR = "data"
+    BACKUP_DIR = "/var/lib/mysql"
     CONTAINER_NAME = "mariadb_backup"
 
 
@@ -44,17 +47,78 @@ def cleanup_docker() -> None:
         raise MariaDBError(f"예상치 못한 오류 발생: {str(e)}")
 
 
+class DockerContainerBase:
+    """Docker 컨테이너 기본 기능 클래스"""
+
+    def __init__(self, container_name: str):
+        self.container_name = container_name
+
+    def start_container(self) -> bool:
+        """컨테이너 시작"""
+        try:
+            print("\nDocker 컨테이너 시작 중...")
+            subprocess.run(["docker", "compose", "up", "-d"], check=True)
+            return True
+        except Exception as e:
+            # 시작 실패 시에만 cleanup 실행
+            cleanup_docker()
+            raise MariaDBError(f"컨테이너 시작 중 오류 발생: {str(e)}")
+
+    def stop_container(self) -> bool:
+        """컨테이너 중지 및 정리"""
+        try:
+            print("\n컨테이너 정지 및 정리 중...")
+            cleanup_docker()
+            return True
+        except Exception as e:
+            raise MariaDBError(f"컨테이너 정지 중 오류 발생: {str(e)}")
+
+    def is_container_running(self) -> bool:
+        """컨테이너 실행 상태 확인"""
+        try:
+            result = subprocess.run(
+                [
+                    "docker",
+                    "container",
+                    "inspect",
+                    "-f",
+                    "{{.State.Running}}",
+                    self.container_name,
+                ],
+                capture_output=True,
+                text=True,
+            )
+            return result.returncode == 0 and "true" in result.stdout.lower()
+        except:
+            return False
+
+
+class MariaDBCommandBuilder:
+    """MySQL 명령어 생성 유틸리티 클래스"""
+
+    @staticmethod
+    def get_mariadb_command(user: str, password: Optional[str] = None) -> str:
+        pwd_option = f"-p'{password}'" if password else ""
+        return f"mysql -u {user} {pwd_option}"
+
+    @staticmethod
+    def get_mariadbdump_command(
+        user: str, password: str, target: str, output_path: str
+    ) -> str:
+        pwd_option = f"-p'{password}'" if password else ""
+        return f"mysqldump -u {user} {pwd_option} {target} > {output_path}"
+
+    @staticmethod
+    def get_mariadb_ping_command(user: str, password: Optional[str] = None) -> str:
+        pwd_option = f"-p'{password}'" if password else ""
+        return f"mysqladmin -u {user} {pwd_option} ping"
+
+
 class ConfigManager:
     """설정 파일 관리 클래스"""
 
     def __init__(self):
-        self._check_config_dirs()
         self.found_configs = self._find_configs()
-
-    def _check_config_dirs(self) -> None:
-        """기본 설정 디렉토리 존재 여부 확인"""
-        if not os.path.exists(Constants.CNF_DIR):
-            raise MariaDBError(f"{Constants.CNF_DIR} 디렉토리가 없습니다.")
 
     def _find_configs(self) -> dict:
         """존재하는 설정 파일/디렉토리 확인"""
@@ -75,15 +139,14 @@ class ConfigManager:
 
         return configs
 
+    def check_config_dirs(self) -> None:
+        """기본 설정 디렉토리 존재 여부 확인"""
+        if not os.path.exists(Constants.CNF_DIR):
+            raise MariaDBError(f"{Constants.CNF_DIR} 디렉토리가 없습니다.")
+
     def modify_socket_path(self, version: str) -> bool:
         """버전에 따른 소켓 경로 수정"""
         try:
-            if not os.path.exists(Constants.MY_CNF):
-                print(
-                    f"\n{Constants.MY_CNF} 파일이 없습니다. 소켓 경로 수정을 건너뜁니다."
-                )
-                return True
-
             content = self._read_config()
             version_num = float(version.split(".")[1])
             socket_path = (
@@ -106,19 +169,13 @@ class ConfigManager:
 
     def _read_config(self) -> str:
         """설정 파일 읽기"""
-        try:
-            with open(Constants.MY_CNF, "r") as f:
-                return f.read()
-        except Exception as e:
-            raise MariaDBError(f"설정 파일 읽기 실패: {str(e)}")
+        with open(Constants.MY_CNF, "r") as f:
+            return f.read()
 
     def _write_config(self, content: str) -> None:
         """설정 파일 쓰기"""
-        try:
-            with open(Constants.MY_CNF, "w") as f:
-                f.write(content)
-        except Exception as e:
-            raise MariaDBError(f"설정 파일 쓰기 실패: {str(e)}")
+        with open(Constants.MY_CNF, "w") as f:
+            f.write(content)
 
 
 class DockerComposeManager:
@@ -172,6 +229,161 @@ class DockerComposeManager:
     ports:
       - "3306:3306"
 """
+
+
+class BackupManager(DockerContainerBase):
+    """백업 관리 클래스"""
+
+    def __init__(self, container_name: str):
+        super().__init__(container_name)
+        self.date_str = datetime.now().strftime("%Y%m%d")
+        self.init_timeout = 300  # 5분
+        self.operation_timeout = 7200  # 2시간
+        self.mariadb_cmd = MariaDBCommandBuilder()
+
+    def get_backup_target(self) -> Optional[Tuple[str, str, str]]:
+        """백업 대상과 비밀번호 입력 받기"""
+        try:
+            print("\n백업 대상을 입력하세요.")
+            print("형식: database 또는 database.table")
+            target = input("입력: ").strip()
+
+            if not target:
+                print("입력값이 없습니다.")
+                return None
+
+            password = input("\nMariaDB root 비밀번호를 입력하세요: ").strip()
+
+            if "." in target:
+                db, table = target.split(".")
+                return (db, table, password)
+            return (target, None, password)
+
+        except Exception as e:
+            raise MariaDBError(f"백업 대상 입력 중 오류 발생: {str(e)}")
+
+    def wait_for_mariadb_ready(
+        self, max_attempts: Optional[int] = None, password: Optional[str] = None
+    ) -> bool:
+        """MariaDB 서버가 준비될 때까지 대기"""
+        if max_attempts is None:
+            max_attempts = self.init_timeout
+
+        print("\nMariaDB 서버 준비 대기 중...")
+        print(f"최대 대기 시간: {max_attempts}초")
+        attempt = 0
+
+        while attempt < max_attempts:
+            try:
+                if attempt % 5 == 0:
+                    check_cmd = self.mariadb_cmd.get_mariadb_ping_command(
+                        Constants.MARIADB_USER, password
+                    )
+                    exec_cmd = [
+                        "docker",
+                        "container",
+                        "exec",
+                        self.container_name,
+                        "bash",
+                        "-c",
+                        check_cmd,
+                    ]
+
+                    result = subprocess.run(
+                        exec_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        universal_newlines=True,
+                    )
+
+                    if result.returncode == 0 and "mysqld is alive" in result.stdout:
+                        print("\nMariaDB 서버 준비 완료!")
+                        return True
+
+                    if "Access denied" in result.stderr and not password:
+                        raise MariaDBError("MariaDB 접속을 위한 비밀번호가 필요합니다.")
+
+                if attempt > 0 and attempt % 10 == 0:
+                    print(f"\n{attempt}초 경과... (서버 초기화 중)")
+                else:
+                    print(".", end="", flush=True)
+
+            except subprocess.CalledProcessError:
+                pass
+
+            time.sleep(1)
+            attempt += 1
+
+        raise MariaDBError(f"MariaDB 서버 준비 시간 초과 ({max_attempts}초)")
+
+    def execute_backup(
+        self, db: str, password: str, table: Optional[str] = None
+    ) -> bool:
+        """백업 실행"""
+        try:
+            sql_dir = os.path.join(os.getcwd(), Constants.SQL_DIR)
+            os.makedirs(sql_dir, exist_ok=True)
+
+            if not self.is_container_running():
+                self.start_container()
+
+            self.wait_for_mariadb_ready(password=password)
+
+            backup_target = f"{db}.{table}" if table else db
+            backup_file = f"{self.date_str}_{backup_target.replace('.', '_')}.sql"
+            container_backup_path = f"{Constants.BACKUP_DIR}/{backup_file}"
+            local_backup_path = os.path.join(sql_dir, backup_file)
+
+            print(f"\n{backup_target} 백업 중...")
+            self._perform_backup(backup_target, password, container_backup_path)
+            self._copy_backup_to_local(container_backup_path, local_backup_path)
+
+            self.stop_container()
+
+            print(f"\n백업 완료: {Constants.SQL_DIR}/{backup_file}")
+            return True
+
+        except Exception as e:
+            self.stop_container()  # 오류 발생 시에도 정리
+            raise MariaDBError(f"백업 실행 중 오류 발생: {str(e)}")
+
+    def _perform_backup(
+        self, backup_target: str, password: str, backup_path: str
+    ) -> None:
+        """백업 실행"""
+        dump_cmd = self.mariadb_cmd.get_mariadbdump_command(
+            Constants.MYSQL_USER, password, backup_target, backup_path
+        )
+        exec_cmd = [
+            "docker",
+            "container",
+            "exec",
+            self.container_name,
+            "bash",
+            "-c",
+            dump_cmd,
+        ]
+
+        process = subprocess.Popen(
+            exec_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            universal_newlines=True,
+        )
+        _, stderr = process.communicate()
+
+        if process.returncode != 0:
+            if "Access denied" in stderr:
+                raise MariaDBError("MySQL 비밀번호가 올바르지 않습니다.")
+            raise MariaDBError(f"mysqldump 실행 중 오류: {stderr}")
+
+    def _copy_backup_to_local(self, container_path: str, local_path: str) -> None:
+        """백업 파일을 로컬로 복사"""
+        subprocess.run(
+            f"docker cp {self.container_name}:{container_path} {local_path}",
+            shell=True,
+            check=True,
+        )
 
 
 class VersionManager:
@@ -506,7 +718,7 @@ def signal_handler(sig, frame):
     """시그널 핸들러"""
     print("\n\n프로그램을 안전하게 종료합니다.")
     cleanup_docker()
-    sys.exit(0)
+    exit(0)
 
 
 def main():
@@ -519,38 +731,60 @@ def main():
 
         # 설정 관리자 초기화
         config_manager = ConfigManager()
+        config_manager.check_config_dirs()
 
         # MariaDB 버전 선택
+        print("\n도커 컨테이너에서 실행할 MariaDB 버전을 선택하세요:")
         versions = VersionManager.display_versions()
         target_version = VersionManager.select_version(versions)
 
-        # 설정 파일 소켓 경로 수정
-        config_manager.modify_socket_path(target_version)
+        if target_version:
+            # 버전별 소켓 경로 수정
+            config_manager.modify_socket_path(target_version)
 
-        # Docker Compose 설정 생성 및 컨테이너 실행
-        docker_manager = DockerComposeManager(target_version)
-        docker_manager.config_manager = config_manager
+            # Docker Compose 설정 생성
+            docker_manager = DockerComposeManager(target_version)
+            docker_manager.config_manager = config_manager
+            docker_manager.create_config()
 
-        docker_manager.create_config()
+            # ToDo
+            # 백업 관리자 초기화
+            backup_manager = BackupManager(docker_manager.container_name)
 
-        # 컨테이너 실행
-        print("\nDocker 컨테이너를 시작합니다...")
-        subprocess.run(["docker", "compose", "up", "-d"], check=True)
+            print("\n작업을 선택하세요:")
+            print("1. 컨테이너만 실행")
+            print("2. 백업 진행")
 
-        print(f"\n컨테이너가 실행되었습니다.")
-        print(
-            f"\n접속 방법: docker container exec -it {docker_manager.container_name} bash"
-        )
-        print("종료 시: docker compose down -v")
+            choice = input("선택 (1 또는 2): ").strip()
+
+            if choice == "1":
+                backup_manager.start_container()
+                print("\n컨테이너 실행이 완료되었씁니다.")
+                print(
+                    f"\n접속 방법: docker container exec -it {docker_manager.container_name}"
+                )
+                print("필수! 종료: docker compose down -v")
+            elif choice == "2":
+                # 버전이 같은 경우 바로 백업 진행
+                backup_info = backup_manager.get_backup_target()
+                if backup_info:
+                    db, table, password = backup_info
+                    backup_manager.execute_backup(db, password, table)
+                else:
+                    print("\n백업 대상 정보 입력이 취소되었습니다.")
+                    exit(1)
+            else:
+                print("\n잘못된 선택입니다.")
+                exit(1)
 
     except MariaDBError as e:
         print(f"\n오류 발생: {str(e)}")
         cleanup_docker()
-        sys.exit(1)
+        exit(1)
     except Exception as e:
         print(f"\n예상치 못한 오류 발생: {str(e)}")
         cleanup_docker()
-        sys.exit(1)
+        exit(1)
 
 
 if __name__ == "__main__":
