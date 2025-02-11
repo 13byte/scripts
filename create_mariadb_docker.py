@@ -5,7 +5,7 @@ import subprocess
 import glob
 import re
 import sys
-from typing import Optional
+from typing import List, Dict, Tuple, Optional
 
 
 class MariaDBError(Exception):
@@ -17,6 +17,7 @@ class MariaDBError(Exception):
 class Constants:
     """상수 정의 클래스"""
 
+    MAX_ATTEMPTS = 3
     DEFAULT_SOCKET_PATH = "/var/lib/mysql/mysql.sock"
     OLD_SOCKET_PATH = "/var/run/mysqld/mysqld.sock"
     CNF_DIR = "cnf"  # 기본 설정 디렉토리
@@ -173,10 +174,10 @@ class DockerComposeManager:
 """
 
 
-class MariaDBVersions:
+class VersionManager:
     """MariaDB 버전 관리 클래스"""
 
-    VERSIONS = {
+    MARIADB_VERSIONS = {
         "10.0": [
             "10.0.15",
             "10.0.16",
@@ -437,20 +438,23 @@ class MariaDBVersions:
     }
 
     @classmethod
-    def display_versions(cls) -> None:
+    def display_versions(cls) -> List[str]:
         """버전 목록 표시"""
         try:
+            all_versions = []
             version_count = 1
-            print("\nMariaDB 버전 선택:")
-            print("=" * 100)
 
-            for major_version, versions in cls.VERSIONS.items():
-                if versions:
+            print("\nMySQL 버전 선택:")
+            print("=" * 120)
+
+            for major_version, versions in cls.MARIADB_VERSIONS.items():
+                if versions:  # 버전이 있는 그룹만 표시
                     print(f"\n{major_version}.x:")
-                    print("-" * 100)
+                    print("-" * 120)
 
                     current_line = []
                     for version in versions:
+                        all_versions.append(version)
                         current_line.append(f"{version_count:3d}. {version:12}")
                         version_count += 1
 
@@ -461,24 +465,16 @@ class MariaDBVersions:
                     if current_line:  # 마지막 줄 출력
                         print("".join(current_line))
 
+            return all_versions
+
         except Exception as e:
             raise MariaDBError(f"버전 표시 중 오류 발생: {str(e)}")
 
     @classmethod
-    def get_all_versions(cls) -> list:
-        """모든 버전 리스트 반환"""
-        all_versions = []
-        for versions in cls.VERSIONS.values():
-            all_versions.extend(versions)
-        return all_versions
-
-    @classmethod
-    def select_version(cls) -> str:
+    def select_version(cls, versions: List[str]) -> Optional[str]:
         """버전 선택"""
-        cls.display_versions()
-        all_versions = cls.get_all_versions()
-
-        while True:
+        attempts = 0
+        while attempts < Constants.MAX_ATTEMPTS:
             try:
                 choice = input("\n버전 번호를 입력하세요 (0: 종료): ").strip()
                 if not choice:
@@ -487,18 +483,23 @@ class MariaDBVersions:
 
                 if choice == "0":
                     print("프로그램을 종료합니다.")
-                    sys.exit(0)
+                    exit(0)
 
                 choice_idx = int(choice) - 1
-                if 0 <= choice_idx < len(all_versions):
-                    return all_versions[choice_idx]
+                if 0 <= choice_idx < len(versions):
+                    return versions[choice_idx]
 
-                print(f"1-{len(all_versions)} 사이의 숫자를 입력하세요.")
+                print(f"1-{len(versions)} 사이의 숫자를 입력하세요.")
 
             except ValueError:
                 print("올바른 숫자를 입력하세요.")
             except Exception as e:
                 print(f"\n오류 발생: {str(e)}")
+
+            attempts += 1
+
+        print("최대 시도 횟수를 초과했습니다.")
+        return None
 
 
 def signal_handler(sig, frame):
@@ -520,7 +521,8 @@ def main():
         config_manager = ConfigManager()
 
         # MariaDB 버전 선택
-        target_version = MariaDBVersions.select_version()
+        versions = VersionManager.display_versions()
+        target_version = VersionManager.select_version(versions)
 
         # 설정 파일 소켓 경로 수정
         config_manager.modify_socket_path(target_version)
