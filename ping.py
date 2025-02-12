@@ -12,7 +12,7 @@ from collections import deque
 
 @dataclass
 class PingResult:
-    host: str
+    host: str  # IP 주소
     success: bool
     response_time: float
     timestamp: datetime.datetime
@@ -30,10 +30,19 @@ def optimize_system_settings():
     try:
         # 파일 디스크립터 제한 증가
         resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
-
-        # TCP 커널 파라미터 최적화 시도 (root 권한 필요)
-        os.system("sysctl -w net.ipv4.tcp_tw_reuse=1 > /dev/null 2>&1")
-        os.system("sysctl -w net.ipv4.tcp_fin_timeout=30 > /dev/null 2>&1")
+        
+        if platform.system() != "Darwin":  # Linux only
+            # TCP 커널 파라미터 최적화
+            settings = [
+                "net.ipv4.tcp_tw_reuse=1",
+                "net.ipv4.tcp_fin_timeout=15",
+                "net.ipv4.tcp_keepalive_time=30",
+                "net.ipv4.tcp_keepalive_intvl=5",
+                "net.ipv4.tcp_keepalive_probes=3"
+            ]
+            
+            for setting in settings:
+                os.system(f"sysctl -w {setting} > /dev/null 2>&1")
     except Exception:
         pass
 
@@ -44,14 +53,16 @@ def optimize_system_settings():
         pass
 
 
-async def execute_ping(host: str) -> Tuple[bool, float]:
-    """최적화된 ping 실행"""
+async def execute_ping(ip: str) -> Tuple[bool, float]:
+    """ping 실행"""
     is_darwin = platform.system() == "Darwin"
-
+    
     if is_darwin:
-        cmd = ["ping", "-c", "1", "-W", "1000", "-q", host]
+        # Mac OS 최적화 설정
+        cmd = ["ping", "-c", "1", "-W", "500", "-q", "-n", ip]  # -n 추가: numeric output only
     else:
-        cmd = ["ping", "-c", "1", "-W", "1", "-n", "-q", host]
+        # Linux 최적화 설정
+        cmd = ["ping", "-c", "1", "-W", "0.5", "-n", "-q", ip]
 
     try:
         start_time = datetime.datetime.now()
@@ -59,11 +70,11 @@ async def execute_ping(host: str) -> Tuple[bool, float]:
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            preexec_fn=os.setsid,
+            preexec_fn=os.setsid
         )
 
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=1.0)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=0.5)
             if proc.returncode == 0:
                 for line in stdout.decode().split("\n"):
                     if "min/avg/max" in line:
@@ -91,30 +102,11 @@ class PingMonitor:
         self.current_history_index: Dict[str, int] = {}
         self.consecutive_failures: Dict[str, int] = {}
         self.consecutive_successes: Dict[str, int] = {}
-        self.batch_size = 50  # M 시리즈 성능 고려
+        self.batch_size = 100
         self.results_cache: Dict[str, deque] = {}
         self.max_history_entries = 1000
         self.changed_hosts: Set[str] = set()
-        self.semaphore = asyncio.Semaphore(200)  # 동시 실행 제한
-
-        # 호스트 주소 캐시
-        self._host_cache: Dict[str, str] = {}
-
-    async def preload_dns(self):
-        """DNS 미리 로드"""
-        for group in self.groups.values():
-            for host in group:
-                if host not in self._host_cache:
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "getent", "hosts", host, stdout=asyncio.subprocess.PIPE
-                        )
-                        stdout, _ = await proc.communicate()
-                        if stdout:
-                            ip = stdout.decode().split()[0]
-                            self._host_cache[host] = ip
-                    except Exception:
-                        self._host_cache[host] = host
+        self.semaphore = asyncio.Semaphore(500)
 
     def clear_screen(self):
         os.system(self.clear_command)
@@ -166,12 +158,11 @@ class PingMonitor:
         self.consecutive_successes[host] = 0
         self.results_cache[host] = deque(maxlen=self.max_history_entries)
 
-    async def ping_server(self, host: str) -> PingResult:
+    async def ping_server(self, ip: str) -> PingResult:
+        """ping 실행"""
         async with self.semaphore:
-            # 캐시된 IP 사용
-            target_host = self._host_cache.get(host, host)
-            success, response_time = await execute_ping(target_host)
-            result = PingResult(host, success, response_time, datetime.datetime.now())
+            success, response_time = await execute_ping(ip)
+            result = PingResult(ip, success, response_time, datetime.datetime.now())
             self.update_host_status(result)
             return result
 
@@ -329,9 +320,6 @@ class PingMonitor:
 
     async def monitor_all_groups(self):
         try:
-            # DNS 미리 로드
-            await self.preload_dns()
-
             while self.running:
                 start_time = datetime.datetime.now()
 
@@ -356,7 +344,6 @@ class PingMonitor:
             self.results_cache[host].clear()
         self.results_cache.clear()
         self.status_history.clear()
-        self._host_cache.clear()
 
 
 def get_monitor_settings() -> MonitorSettings:
