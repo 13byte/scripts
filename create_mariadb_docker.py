@@ -118,7 +118,35 @@ class ConfigManager:
     """설정 파일 관리 클래스"""
 
     def __init__(self):
+        self._create_default_configs()
         self.found_configs = self._find_configs()
+
+    def _create_default_configs(self) -> None:
+        """기본 설정 파일/디렉터리 생성 (없는 경우에만)"""
+        try:
+            # cnf 디렉터리가 없으면 생성
+            if not os.path.exists(Constants.CNF_DIR):
+                os.makedirs(Constants.CNF_DIR)
+                print(f"\n기본 설정 디렉터리 생성: {Constants.CNF_DIR}")
+
+            # my.cnf.d 디렉터리가 없으면 생성
+            if not os.path.exists(Constants.MYCNF_D_DIR):
+                os.makedirs(Constants.MYCNF_D_DIR)
+                print(f"my.cnf.d 디렉터리 생성: {Constants.MYCNF_D_DIR}")
+
+            # mysql 디렉터리가 없으면 생성
+            if not os.path.exists(Constants.MYSQL_CNF_DIR):
+                os.makedirs(Constants.MYSQL_CNF_DIR)
+                print(f"mysql 디렉터리 생성: {Constants.MYSQL_CNF_DIR}")
+
+            # my.cnf 파일이 없으면 include 설정으로 생성
+            if not os.path.exists(Constants.MY_CNF):
+                with open(Constants.MY_CNF, "w") as f:
+                    f.write("!include /etc/my.cnf.d/\n!include /etc/mysql/\n")
+                print(f"my.cnf 파일 생성 (include 설정): {Constants.MY_CNF}")
+
+        except Exception as e:
+            raise MariaDBError(f"설정 파일/디렉터리 생성 중 오류 발생: {str(e)}")
 
     def _find_configs(self) -> dict:
         """존재하는 설정 파일/디렉토리 확인"""
@@ -759,9 +787,9 @@ def main():
 
             if choice == "1":
                 backup_manager.start_container()
-                print("\n컨테이너 실행이 완료되었씁니다.")
+                print("\n컨테이너 실행이 완료되었습니다.")
                 print(
-                    f"\n접속 방법: docker container exec -it {docker_manager.container_name}"
+                    f"\n접속 방법: docker container exec -it {docker_manager.container_name} bash"
                 )
                 print("필수! 종료: docker compose down -v")
             elif choice == "2":
