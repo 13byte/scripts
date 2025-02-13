@@ -94,24 +94,81 @@ class DockerContainerBase:
 
 
 class MariaDBCommandBuilder:
-    """MySQL 명령어 생성 유틸리티 클래스"""
+    """MariaDB 명령어 생성 유틸리티 클래스"""
 
     @staticmethod
-    def get_mariadb_command(user: str, password: Optional[str] = None) -> str:
+    def _check_version_for_commands(version: str) -> bool:
+        """버전에 따른 명령어 세트 결정
+        Returns:
+            bool: True if should use mariadb commands, False if should use mysql commands
+        """
+        try:
+            major_version = int(version.split(".")[0])
+            minor_version = int(version.split(".")[1])
+
+            # 11.0 이상 버전은 mariadb 명령어 사용
+            if major_version >= 11:
+                return True
+            # 10.5 이상 버전은 mariadb 명령어 권장이지만 mysql 명령어도 지원
+            elif major_version == 10 and minor_version >= 5:
+                return True
+            # 10.4 이하 버전은 mysql 명령어 사용
+            return False
+        except (IndexError, ValueError):
+            # 버전 파싱 실패시 기본적으로 mysql 명령어 사용
+            return False
+
+    @staticmethod
+    def get_mariadb_command(
+        version: str, user: str, password: Optional[str] = None
+    ) -> str:
+        """버전별 적절한 클라이언트 명령어 반환"""
         pwd_option = f"-p'{password}'" if password else ""
-        return f"mysql -u {user} {pwd_option}"
+        cmd = (
+            "mariadb"
+            if MariaDBCommandBuilder._check_version_for_commands(version)
+            else "mysql"
+        )
+        return f"{cmd} -u {user} {pwd_option}"
 
     @staticmethod
     def get_mariadbdump_command(
-        user: str, password: str, target: str, output_path: str
+        version: str, user: str, password: str, target: str, output_path: str
     ) -> str:
+        """버전별 적절한 덤프 명령어 반환"""
         pwd_option = f"-p'{password}'" if password else ""
-        return f"mysqldump -u {user} {pwd_option} {target} > {output_path}"
+        cmd = (
+            "mariadb-dump"
+            if MariaDBCommandBuilder._check_version_for_commands(version)
+            else "mysqldump"
+        )
+        return f"{cmd} -u {user} {pwd_option} {target} > {output_path}"
 
     @staticmethod
-    def get_mariadb_ping_command(user: str, password: Optional[str] = None) -> str:
+    def get_mariadb_ping_command(
+        version: str, user: str, password: Optional[str] = None
+    ) -> str:
+        """버전별 적절한 ping 명령어 반환"""
         pwd_option = f"-p'{password}'" if password else ""
-        return f"mysqladmin -u {user} {pwd_option} ping"
+        cmd = (
+            "mariadb-admin"
+            if MariaDBCommandBuilder._check_version_for_commands(version)
+            else "mysqladmin"
+        )
+        return f"{cmd} -u {user} {pwd_option} ping"
+
+    @staticmethod
+    def get_mariadb_upgrade_command(
+        version: str, user: str, password: Optional[str] = None
+    ) -> str:
+        """버전별 적절한 업그레이드 명령어 반환"""
+        pwd_option = f"-p'{password}'" if password else ""
+        cmd = (
+            "mariadb-upgrade"
+            if MariaDBCommandBuilder._check_version_for_commands(version)
+            else "mysql_upgrade"
+        )
+        return f"{cmd} -u {user} {pwd_option} --force"
 
 
 class ConfigManager:
@@ -207,11 +264,11 @@ class ConfigManager:
 
 
 class DockerComposeManager:
-
     def __init__(self, version: str):
         self.version = version
         self.container_name = Constants.CONTAINER_NAME
         self.current_dir = os.path.abspath(os.getcwd())
+        self.config_manager = ConfigManager()  # ConfigManager 인스턴스 생성
 
     def create_config(self) -> bool:
         """Docker Compose 설정 파일 생성"""
@@ -262,8 +319,9 @@ class DockerComposeManager:
 class BackupManager(DockerContainerBase):
     """백업 관리 클래스"""
 
-    def __init__(self, container_name: str):
+    def __init__(self, container_name: str, version: str):
         super().__init__(container_name)
+        self.version = version  # 버전 정보 추가
         self.date_str = datetime.now().strftime("%Y%m%d")
         self.init_timeout = 300  # 5분
         self.operation_timeout = 7200  # 2시간
@@ -305,7 +363,7 @@ class BackupManager(DockerContainerBase):
             try:
                 if attempt % 5 == 0:
                     check_cmd = self.mariadb_cmd.get_mariadb_ping_command(
-                        Constants.MARIADB_USER, password
+                        self.version, Constants.MARIADB_USER, password
                     )
                     exec_cmd = [
                         "docker",
@@ -328,8 +386,10 @@ class BackupManager(DockerContainerBase):
                         print("\nMariaDB 서버 준비 완료!")
                         return True
 
-                    if "Access denied" in result.stderr and not password:
-                        raise MariaDBError("MariaDB 접속을 위한 비밀번호가 필요합니다.")
+                    if "Access denied" in result.stderr:
+                        # 접속은 됐지만 비밀번호가 틀린 경우도 서버가 준비된 것
+                        print("\nMariaDB 서버 준비 완료! (인증 필요)")
+                        return True
 
                 if attempt > 0 and attempt % 10 == 0:
                     print(f"\n{attempt}초 경과... (서버 초기화 중)")
@@ -379,31 +439,39 @@ class BackupManager(DockerContainerBase):
         self, backup_target: str, password: str, backup_path: str
     ) -> None:
         """백업 실행"""
-        dump_cmd = self.mariadb_cmd.get_mariadbdump_command(
-            Constants.MARIADB_USER, password, backup_target, backup_path
-        )
-        exec_cmd = [
-            "docker",
-            "container",
-            "exec",
-            self.container_name,
-            "bash",
-            "-c",
-            dump_cmd,
-        ]
+        try:
+            dump_cmd = self.mariadb_cmd.get_mariadbdump_command(
+                version=self.version,  # 버전 정보
+                user=Constants.MARIADB_USER,
+                password=password,
+                target=backup_target,
+                output_path=backup_path,
+            )
+            exec_cmd = [
+                "docker",
+                "container",
+                "exec",
+                self.container_name,
+                "bash",
+                "-c",
+                dump_cmd,
+            ]
 
-        process = subprocess.Popen(
-            exec_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-        )
-        _, stderr = process.communicate()
+            process = subprocess.Popen(
+                exec_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+            _, stderr = process.communicate()
 
-        if process.returncode != 0:
-            if "Access denied" in stderr:
-                raise MariaDBError("MySQL 비밀번호가 올바르지 않습니다.")
-            raise MariaDBError(f"mysqldump 실행 중 오류: {stderr}")
+            if process.returncode != 0:
+                if "Access denied" in stderr:
+                    raise MariaDBError("MariaDB 비밀번호가 올바르지 않습니다.")
+                raise MariaDBError(f"mariadb-dump 실행 중 오류: {stderr}")
+
+        except Exception as e:
+            raise MariaDBError(f"백업 실행 중 오류 발생: {str(e)}")
 
     def _copy_backup_to_local(self, container_path: str, local_path: str) -> None:
         """백업 파일을 로컬로 복사"""
@@ -742,6 +810,235 @@ class VersionManager:
         return None
 
 
+class VersionUpgradeManager(DockerContainerBase):
+    """MariaDB 버전 업그레이드 관리 클래스"""
+
+    def __init__(self, container_name: str, version: str):
+        super().__init__(container_name)
+        self.version = version
+        self.password = None
+        self.mariadb_cmd = MariaDBCommandBuilder()
+        self.backup_manager = BackupManager(container_name, version)
+        # MariaDB 업그레이드 경로 정의
+        self.latest_minor_versions = {
+            "10.0": "10.0.38",  # 10.0 계열의 마지막 버전
+            "10.1": "10.1.48",  # 10.1 계열의 마지막 버전
+            "10.2": "10.2.44",  # 10.2 계열의 마지막 버전
+            "10.3": "10.3.39",  # 10.3 계열의 마지막 버전
+            "10.4": "10.4.34",  # 10.4 계열의 마지막 버전
+            "10.5": "10.5.28",  # 10.5 계열의 마지막 버전
+            "10.6": "10.6.21",  # 10.6 계열의 마지막 버전
+            "10.11": "10.11.11",  # 10.11 계열의 마지막 버전
+            "11.0": "11.0.6",  # 11.0 계열의 마지막 버전
+            "11.1": "11.1.6",  # 11.1 계열의 마지막 버전
+            "11.2": "11.2.6",  # 11.2 계열의 마지막 버전
+            "11.3": "11.3.2",  # 11.3 계열의 마지막 버전
+        }
+
+    def wait_for_mariadb_ready(
+        self, max_attempts: Optional[int] = None, password: Optional[str] = None
+    ) -> bool:
+        return self.backup_manager.wait_for_mariadb_ready(max_attempts, password)
+
+    def _needs_manual_upgrade(self, current_version: str, next_version: str) -> bool:
+        """해당 버전이 수동 업그레이드가 필요한지 확인"""
+        try:
+            # 메이저 버전이 같으면 업그레이드 불필요
+            current_major = ".".join(current_version.split(".")[:2])
+            next_major = ".".join(next_version.split(".")[:2])
+
+            if current_major == next_major:
+                return False
+
+            # 메이저 버전이 다른 경우만 수동 업그레이드 체크
+            major, minor = map(int, next_version.split(".")[:2])
+
+            # 10.6 이상은 자동 업그레이드
+            if major == 10 and minor >= 6:
+                return False
+            # 10.5 이하는 수동 업그레이드 필요
+            if major == 10 and minor <= 5:
+                return True
+            # 11.0 이상은 자동 업그레이드
+            if major >= 11:
+                return False
+
+            return True
+        except:
+            return True
+
+    def get_source_version(self) -> str:
+        """원본 MariaDB 버전 입력 받기"""
+        while True:
+            print("\n원본 데이터의 MariaDB 버전을 선택하세요:")
+            print("1. 10.0")
+            print("2. 10.1")
+            print("3. 10.2")
+            print("4. 10.3")
+            print("5. 10.4")
+            print("6. 10.5")
+            print("7. 10.6")
+            print("8. 10.11")
+            print("9. 11.0")
+            print("10. 11.1")
+            choice = input("선택 (1-10): ").strip()
+
+            version_map = {
+                "1": "10.0",
+                "2": "10.1",
+                "3": "10.2",
+                "4": "10.3",
+                "5": "10.4",
+                "6": "10.5",
+                "7": "10.6",
+                "8": "10.11",
+                "9": "11.0",
+                "10": "11.1",
+            }
+            if choice in version_map:
+                return version_map[choice]
+            print("잘못된 선택입니다.")
+
+    def get_upgrade_path(self, source_version: str, target_version: str) -> List[str]:
+        """업그레이드 경로 생성"""
+        source_major = ".".join(source_version.split(".")[:2])  # "10.3"
+        target_major = ".".join(target_version.split(".")[:2])  # "10.3"
+
+        # 같은 메이저 버전이면 직접 타겟으로
+        if source_major == target_major:
+            return [source_version, target_version]
+
+        if source_major.startswith("10."):
+            source_minor = int(source_major.split(".")[1])
+            if source_minor <= 3:
+                # 10.3 이하에서는 먼저 10.4를 거친 후 target으로
+                if target_version.startswith("10.4"):
+                    # 10.4.x로 가는 경우 직접 해당 버전으로
+                    return [source_version, target_version]
+                else:
+                    # 10.4보다 높은 버전으로 갈 때는 10.4.34를 거쳐감
+                    return [source_version, "10.4.34", target_version]
+            else:
+                # 10.4 이상은 직접 target으로
+                return [source_version, target_version]
+        else:
+            # 11.x 버전은 직접 이동
+            return [source_version, target_version]
+
+    def execute_upgrade(self, upgrade_path: List[str], password: str) -> bool:
+        """업그레이드 실행"""
+        try:
+            self.password = password
+            source_version = upgrade_path[0]
+            target_version = upgrade_path[-1]
+
+            print(f"\n{source_version} -> {target_version} 업그레이드를 진행합니다...")
+
+            for i in range(len(upgrade_path) - 1):
+                current_version = upgrade_path[i]
+                next_version = upgrade_path[i + 1]
+
+                print(f"\n===== {current_version} -> {next_version} 업그레이드 =====")
+
+                docker_manager = DockerComposeManager(next_version)
+                docker_manager.create_config()
+
+                self.start_container()
+                self.wait_for_mariadb_ready(password=password)
+
+                # 메이저 버전이 다를 때만 업그레이드 명령어 실행
+                if self._needs_manual_upgrade(current_version, next_version):
+                    self._run_upgrade_command(current_version, next_version, password)
+
+                self.stop_container()
+                cleanup_docker()
+
+            return True
+
+        except Exception as e:
+            cleanup_docker()
+            raise MariaDBError(f"업그레이드 실행 중 오류 발생: {str(e)}")
+
+    def _perform_single_upgrade(
+        self, current_version: str, next_version: str, password: str
+    ) -> None:
+        """단일 버전 업그레이드 수행"""
+        try:
+            print(f"\n{current_version} -> {next_version} 업그레이드 시작...")
+
+            # Docker 설정 생성 및 실행
+            docker_manager = DockerComposeManager(next_version)
+            docker_manager.create_config()
+
+            self.start_container()
+            self.wait_for_mariadb_ready(password=password)
+
+            # 수동 업그레이드가 필요한 버전인지 확인
+            if self._needs_manual_upgrade(next_version):
+                print(f"MariaDB {next_version} 버전은 수동 업그레이드가 필요합니다.")
+                self._run_upgrade_command(current_version, next_version, password)
+            else:
+                print(f"MariaDB {next_version} 버전은 자동 업그레이드를 지원합니다.")
+                print("서버가 자동으로 시스템 테이블을 업그레이드합니다...")
+                # 자동 업그레이드의 경우 서버 시작만으로 충분
+
+            self.stop_container()
+
+        except Exception as e:
+            self.stop_container()
+            raise MariaDBError(
+                f"{current_version} -> {next_version} 업그레이드 중 오류 발생: {str(e)}"
+            )
+
+    def _run_upgrade_command(
+        self, current_version: str, next_version: str, password: str
+    ) -> None:
+        """버전별 적절한 업그레이드 명령어 실행"""
+        try:
+            major, minor = map(int, next_version.split(".")[:2])
+
+            # 10.4.6 이전 버전은 mysql_upgrade 사용
+            if major == 10 and minor <= 4 and float(next_version.split(".")[2]) < 6:
+                upgrade_cmd = (
+                    f"mysql_upgrade -u {Constants.MARIADB_USER} -p'{password}' --force"
+                )
+            else:
+                # 10.4.6 이후 버전은 mariadb-upgrade 사용
+                upgrade_cmd = f"mariadb-upgrade -u {Constants.MARIADB_USER} -p'{password}' --force"
+
+            print(f"\n{upgrade_cmd.split()[0]} 실행 중...")
+
+            process = subprocess.Popen(
+                [
+                    "docker",
+                    "container",
+                    "exec",
+                    self.container_name,
+                    "bash",
+                    "-c",
+                    upgrade_cmd,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+            )
+            stdout, stderr = process.communicate()
+
+            if process.returncode != 0:
+                if "Access denied" in stderr:
+                    raise MariaDBError("MariaDB 비밀번호가 올바르지 않습니다.")
+                raise MariaDBError(f"업그레이드 스크립트 실행 실패: {stderr}")
+
+            if stdout:
+                print("\n업그레이드 스크립트 출력:")
+                print(stdout)
+
+            print(f"\n{current_version} -> {next_version} 업그레이드가 완료되었습니다.")
+
+        except Exception as e:
+            raise MariaDBError(f"업그레이드 스크립트 실행 중 오류 발생: {str(e)}")
+
+
 def signal_handler(sig, frame):
     """시그널 핸들러"""
     print("\n\n프로그램을 안전하게 종료합니다.")
@@ -772,12 +1069,12 @@ def main():
 
             # Docker Compose 설정 생성
             docker_manager = DockerComposeManager(target_version)
-            docker_manager.config_manager = config_manager
             docker_manager.create_config()
 
-            # ToDo
-            # 백업 관리자 초기화
-            backup_manager = BackupManager(docker_manager.container_name)
+            # 백업 관리자 초기화 - version 인자 추가
+            backup_manager = BackupManager(
+                docker_manager.container_name, target_version
+            )
 
             print("\n작업을 선택하세요:")
             print("1. 컨테이너만 실행")
@@ -793,14 +1090,48 @@ def main():
                 )
                 print("필수! 종료: docker compose down -v")
             elif choice == "2":
-                # 버전이 같은 경우 바로 백업 진행
-                backup_info = backup_manager.get_backup_target()
-                if backup_info:
-                    db, table, password = backup_info
-                    backup_manager.execute_backup(db, password, table)
+                # 원본 데이터의 버전 확인
+                upgrade_manager = VersionUpgradeManager(
+                    docker_manager.container_name, target_version
+                )
+                source_version = upgrade_manager.get_source_version()
+                target_major = ".".join(target_version.split(".")[:2])
+                source_major = ".".join(source_version.split(".")[:2])
+
+                # 메이저 버전이 다른 경우에만 업그레이드 진행
+                if source_major != target_major:
+                    print(
+                        f"\n버전 업그레이드가 필요합니다. ({source_version} -> {target_version})"
+                    )
+                    upgrade_path = upgrade_manager.get_upgrade_path(
+                        source_version, target_version
+                    )
+                    print(f"업그레이드 경로: {' -> '.join(upgrade_path)}")
+
+                    if input("\n업그레이드를 진행하시겠습니까? (y/N): ").lower() == "y":
+                        backup_info = backup_manager.get_backup_target()
+                        if backup_info:
+                            db, table, password = backup_info
+                            upgrade_manager.execute_upgrade(upgrade_path, password)
+                            cleanup_docker()
+                            docker_manager = DockerComposeManager(target_version)
+                            docker_manager.create_config()
+                            backup_manager.execute_backup(db, password, table)
+                        else:
+                            print("\n백업 대상 정보 입력이 취소되었습니다.")
+                            exit(1)
+                    else:
+                        print("\n업그레이드를 진행하지 않습니다.")
+                        exit(1)
                 else:
-                    print("\n백업 대상 정보 입력이 취소되었습니다.")
-                    exit(1)
+                    # 같은 메이저 버전이면 바로 백업 진행
+                    backup_info = backup_manager.get_backup_target()
+                    if backup_info:
+                        db, table, password = backup_info
+                        backup_manager.execute_backup(db, password, table)
+                    else:
+                        print("\n백업 대상 정보 입력이 취소되었습니다.")
+                        exit(1)
             else:
                 print("\n잘못된 선택입니다.")
                 exit(1)
