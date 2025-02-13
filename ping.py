@@ -1,18 +1,22 @@
 import asyncio
 import platform
 import datetime
-from typing import List, Dict, Set, Optional, Tuple
+import time
+from typing import List, Dict, Set, Optional, Tuple, DefaultDict
 import sys
 import os
 import signal
 import resource
 from dataclasses import dataclass
-from collections import deque
+from collections import deque, defaultdict
+import gc
+import subprocess
+from concurrent.futures import ThreadPoolExecutor
 
 
 @dataclass
 class PingResult:
-    host: str  # IP 주소
+    host: str
     success: bool
     response_time: float
     timestamp: datetime.datetime
@@ -25,69 +29,183 @@ class MonitorSettings:
     recovery_threshold: int
 
 
+class LRUCache:
+    def __init__(self, capacity: int):
+        self.cache = {}
+        self.capacity = capacity
+        self.usage = deque()
+
+    def get(self, key):
+        if key not in self.cache:
+            return None
+        self.usage.remove(key)
+        self.usage.append(key)
+        return self.cache[key]
+
+    def put(self, key, value):
+        if key in self.cache:
+            self.usage.remove(key)
+        elif len(self.cache) >= self.capacity:
+            oldest = self.usage.popleft()
+            del self.cache[oldest]
+        self.cache[key] = value
+        self.usage.append(key)
+
+
+class ProcessManager:
+    def __init__(self, max_concurrent=350):
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.active_processes = set()
+        self.buffer_size = 65535
+        self.ping_timeout = 0.5  # 타임아웃 시간 감소
+        self.executor = ThreadPoolExecutor(max_workers=max_concurrent)
+
+    async def execute_ping(self, ip: str) -> Tuple[bool, float]:
+        async with self.semaphore:
+            is_darwin = platform.system() == "Darwin"
+
+            if is_darwin:
+                cmd = ["ping", "-c", "1", "-W", "500", "-q", ip]  # 타임아웃 500ms
+            else:
+                cmd = ["ping", "-c", "1", "-w", "0.5", "-q", ip]  # 타임아웃 0.5초
+
+            try:
+                start_time = time.monotonic()
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    preexec_fn=os.setsid,
+                )
+                self.active_processes.add(proc)
+
+                try:
+                    stdout, _ = await asyncio.wait_for(
+                        proc.communicate(), timeout=0.6
+                    )  # 약간 더 긴 타임아웃
+                    elapsed = time.monotonic() - start_time
+                    if proc.returncode == 0:
+                        try:
+                            stdout_str = stdout.decode()
+                            if "min/avg/max" in stdout_str:
+                                avg_time = float(stdout_str.split("/")[4])
+                                return True, avg_time
+                            elif "time=" in stdout_str:
+                                time_str = (
+                                    stdout_str.split("time=")[1]
+                                    .split()[0]
+                                    .replace("ms", "")
+                                )
+                                return True, float(time_str)
+                            return True, elapsed * 1000
+                        except (IndexError, ValueError):
+                            return True, elapsed * 1000
+                    return False, 0.0
+                except asyncio.TimeoutError:
+                    return False, 0.0
+                finally:
+                    if proc in self.active_processes:
+                        self.active_processes.remove(proc)
+                        try:
+                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        except ProcessLookupError:
+                            pass
+            except Exception as e:
+                print(f"Error pinging {ip}: {e}")
+                return False, 0.0
+
+    async def cleanup(self):
+        for proc in list(self.active_processes):
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        self.active_processes.clear()
+        self.executor.shutdown(wait=False)
+
+
+class ResultProcessor:
+    def __init__(self, cache_size=1000):
+        self.cache = LRUCache(cache_size)
+        self.last_results = {}
+        self.statistics: DefaultDict[str, Dict] = defaultdict(
+            lambda: {"success": 0, "total": 0, "last_status": None}
+        )
+
+    def process_result(self, result: PingResult) -> None:
+        self.cache.put(result.host, result)
+        self.statistics[result.host]["total"] += 1
+        if result.success:
+            self.statistics[result.host]["success"] += 1
+        self.statistics[result.host]["last_status"] = result.success
+        self.last_results[result.host] = result
+
+    def get_host_stats(self, host: str) -> Dict:
+        stats = self.statistics[host]
+        total = stats["total"]
+        if total == 0:
+            return {"success_rate": 0.0, "last_status": None}
+        return {
+            "success_rate": (stats["success"] / total) * 100,
+            "last_status": stats["last_status"],
+        }
+
+
+class MemoryOptimizer:
+    def __init__(self):
+        self.gc_interval = 10
+        self.iteration = 0
+        gc.disable()
+
+    def optimize(self):
+        self.iteration += 1
+        if self.iteration % self.gc_interval == 0:
+            gc.collect()
+
+    def cleanup(self):
+        gc.enable()
+
+
 def optimize_system_settings():
-    """시스템 설정 최적화"""
     try:
-        # 파일 디스크립터 제한 증가
+        # 파일 디스크립터 및 프로세스 제한 증가
         resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
-        
-        if platform.system() != "Darwin":  # Linux only
-            # TCP 커널 파라미터 최적화
+        resource.setrlimit(resource.RLIMIT_NPROC, (4096, 4096))
+
+        if platform.system() != "Darwin":
             settings = [
                 "net.ipv4.tcp_tw_reuse=1",
                 "net.ipv4.tcp_fin_timeout=15",
-                "net.ipv4.tcp_keepalive_time=30",
-                "net.ipv4.tcp_keepalive_intvl=5",
-                "net.ipv4.tcp_keepalive_probes=3"
+                "net.core.rmem_max=26214400",
+                "net.core.wmem_max=26214400",
+                "net.ipv4.tcp_rmem='4096 87380 16777216'",
+                "net.ipv4.tcp_wmem='4096 87380 16777216'",
+                "net.ipv4.ip_local_port_range='1024 65535'",
+                "net.ipv4.tcp_max_tw_buckets=1440000",
+                "net.core.somaxconn=1024",
+                "net.ipv4.tcp_max_syn_backlog=1024",
+                "net.ipv4.tcp_synack_retries=2",
+                "net.ipv4.tcp_syn_retries=2",
+                "net.ipv4.ping_group_range='0 2147483647'",
             ]
-            
             for setting in settings:
                 os.system(f"sysctl -w {setting} > /dev/null 2>&1")
-    except Exception:
-        pass
 
-    try:
-        # 프로세스 우선순위 설정 시도
-        os.nice(-10)  # 높은 우선순위 설정 (root 권한 필요)
-    except Exception:
-        pass
+            try:
+                # 실시간 스케줄링 우선순위 설정
+                param = os.sched_param(os.SCHED_RR, 50)
+                os.sched_setscheduler(0, os.SCHED_RR, param)
+            except Exception:
+                pass
 
-
-async def execute_ping(ip: str) -> Tuple[bool, float]:
-    """ping 실행"""
-    is_darwin = platform.system() == "Darwin"
-    
-    if is_darwin:
-        # Mac OS 최적화 설정
-        cmd = ["ping", "-c", "1", "-W", "500", "-q", "-n", ip]  # -n 추가: numeric output only
-    else:
-        # Linux 최적화 설정
-        cmd = ["ping", "-c", "1", "-W", "0.5", "-n", "-q", ip]
-
-    try:
-        start_time = datetime.datetime.now()
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            preexec_fn=os.setsid
-        )
-
+        # 프로세스 우선순위 설정
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=0.5)
-            if proc.returncode == 0:
-                for line in stdout.decode().split("\n"):
-                    if "min/avg/max" in line:
-                        avg_time = float(line.split("/")[4])
-                        return True, avg_time
-            return False, 0.0
+            os.nice(-10)
+        except Exception:
+            pass
 
-        except asyncio.TimeoutError:
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            return False, 0.0
-
-    except Exception:
-        return False, 0.0
+    except Exception as e:
+        print(f"Warning: System optimization failed: {e}")
 
 
 class PingMonitor:
@@ -102,14 +220,19 @@ class PingMonitor:
         self.current_history_index: Dict[str, int] = {}
         self.consecutive_failures: Dict[str, int] = {}
         self.consecutive_successes: Dict[str, int] = {}
-        self.batch_size = 100
         self.results_cache: Dict[str, deque] = {}
-        self.max_history_entries = 1000
+        self.max_history_entries = 100
         self.changed_hosts: Set[str] = set()
-        self.semaphore = asyncio.Semaphore(500)
 
-    def clear_screen(self):
-        os.system(self.clear_command)
+        # 최적화된 컴포넌트들
+        self.process_manager = ProcessManager(max_concurrent=350)
+        self.result_processor = ResultProcessor(cache_size=1000)
+        self.memory_optimizer = MemoryOptimizer()
+        self.executor = ThreadPoolExecutor(max_workers=4)
+
+    async def clear_screen(self):
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self.executor, os.system, self.clear_command)
 
     def sort_ip_addresses(self, ips: List[str]) -> List[str]:
         def ip_to_tuple(ip: str) -> tuple:
@@ -159,12 +282,11 @@ class PingMonitor:
         self.results_cache[host] = deque(maxlen=self.max_history_entries)
 
     async def ping_server(self, ip: str) -> PingResult:
-        """ping 실행"""
-        async with self.semaphore:
-            success, response_time = await execute_ping(ip)
-            result = PingResult(ip, success, response_time, datetime.datetime.now())
-            self.update_host_status(result)
-            return result
+        success, response_time = await self.process_manager.execute_ping(ip)
+        result = PingResult(ip, success, response_time, datetime.datetime.now())
+        self.update_host_status(result)
+        self.result_processor.process_result(result)
+        return result
 
     def update_host_status(self, result: PingResult) -> None:
         host = result.host
@@ -181,15 +303,16 @@ class PingMonitor:
                 self.update_failure_status(host, result.timestamp)
                 self.changed_hosts.add(host)
         else:
+            # 성공할 때마다 실패 카운터 초기화
+            self.consecutive_failures[host] = 0
             self.consecutive_successes[host] += 1
+
             if current_status is False:
                 if self.consecutive_successes[host] >= self.settings.recovery_threshold:
                     self.update_recovery_status(host, result.timestamp)
                     self.changed_hosts.add(host)
-                    self.consecutive_failures[host] = 0
             elif current_status is None:
                 self.status_history[host]["last_status"] = True
-                self.consecutive_failures[host] = 0
 
         self.results_cache[host].append(result)
 
@@ -245,7 +368,13 @@ class PingMonitor:
             right_padding = padding - left_padding
             return " " * left_padding + text + " " * right_padding
 
-    def format_results(self, group_results: Dict[str, List[PingResult]]) -> str:
+    async def format_results(self, group_results: Dict[str, List[PingResult]]) -> str:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.executor, self._format_results_sync, group_results
+        )
+
+    def _format_results_sync(self, group_results: Dict[str, List[PingResult]]) -> str:
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         output = []
 
@@ -320,26 +449,48 @@ class PingMonitor:
 
     async def monitor_all_groups(self):
         try:
+            last_update_time = time.monotonic()
+            screen_update_counter = 0
+
             while self.running:
-                start_time = datetime.datetime.now()
+                current_time = time.monotonic()
+                elapsed = current_time - last_update_time
 
-                group_results = await self.ping_all_groups()
-                self.clear_screen()
-                print(self.format_results(group_results))
+                if elapsed < self.settings.interval:
+                    await asyncio.sleep(0.1)  # 짧은 간격으로 체크
+                    continue
 
-                # 정확한 간격 유지를 위한 sleep 계산
-                elapsed = (datetime.datetime.now() - start_time).total_seconds()
-                remaining = max(0.0, self.settings.interval - elapsed)
-                if remaining > 0:
-                    await asyncio.sleep(remaining)
+                try:
+                    group_results = await self.ping_all_groups()
 
-        except KeyboardInterrupt:
+                    # 화면 업데이트 최적화 (5회마다 화면 지우기)
+                    screen_update_counter += 1
+                    if screen_update_counter >= 5:
+                        await self.clear_screen()
+                        screen_update_counter = 0
+
+                    formatted_results = await self.format_results(group_results)
+                    print(
+                        "\033[2J\033[H" + formatted_results
+                    )  # ANSI 이스케이프 코드 사용
+
+                    self.memory_optimizer.optimize()
+
+                except Exception as e:
+                    print(f"Error during monitoring: {e}")
+
+                last_update_time = current_time  # 실제 실행 완료 시간 기준으로 업데이트
+
+        except asyncio.CancelledError:
             self.running = False
         finally:
-            self.cleanup()
+            self.memory_optimizer.cleanup()
+            await self.cleanup()
 
-    def cleanup(self):
+    async def cleanup(self):
         """리소스 정리"""
+        await self.process_manager.cleanup()
+        self.executor.shutdown(wait=False)
         for host in self.results_cache:
             self.results_cache[host].clear()
         self.results_cache.clear()
@@ -371,7 +522,7 @@ def get_monitor_settings() -> MonitorSettings:
             print("올바른 숫자를 입력해주세요.")
 
 
-def main():
+async def main():
     try:
         # 시스템 설정 최적화
         optimize_system_settings()
@@ -383,8 +534,8 @@ def main():
         monitor = PingMonitor("target_ip.txt", settings)
         monitor.read_groups()
 
-        # 이벤트 루프 실행
-        asyncio.run(monitor.monitor_all_groups())
+        # 모니터링 시작
+        await monitor.monitor_all_groups()
 
     except KeyboardInterrupt:
         print("\n프로그램을 종료합니다.")
@@ -394,4 +545,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except ImportError:
+        pass
+
+    asyncio.run(main())  # 이 줄을 추가
