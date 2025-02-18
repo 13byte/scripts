@@ -752,7 +752,7 @@ class VersionManager:
             all_versions = []
             version_count = 1
 
-            print("\nMySQL 버전 선택:")
+            print("\nMariaDB 버전 선택:")
             print("=" * 120)
 
             for major_version, versions in cls.MARIADB_VERSIONS.items():
