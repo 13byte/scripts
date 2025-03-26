@@ -2,6 +2,7 @@ import asyncio
 import platform
 import datetime
 import time
+import random
 from typing import List, Dict, Set, Optional, Tuple, DefaultDict
 import sys
 import os
@@ -10,8 +11,48 @@ import resource
 from dataclasses import dataclass
 from collections import deque, defaultdict
 import gc
-import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from tabulate import tabulate
+
+# 필요한 라이브러리 자동 설치 (조용히)
+try:
+    from icmplib import async_ping
+
+    USE_ICMPLIB = True
+except ImportError:
+    import subprocess
+
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "icmplib", "tabulate", "uvloop"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        from icmplib import async_ping
+
+        USE_ICMPLIB = True
+    except ImportError:
+        USE_ICMPLIB = False
+
+# uvloop 설치 및 적용 (조용히)
+try:
+    import uvloop
+
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except ImportError:
+    try:
+        import subprocess
+
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "uvloop"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except:
+        pass
 
 
 @dataclass
@@ -27,6 +68,7 @@ class MonitorSettings:
     interval: int
     failure_threshold: int
     recovery_threshold: int
+    batch_size: int = 500
 
 
 class LRUCache:
@@ -53,36 +95,47 @@ class LRUCache:
 
 
 class ProcessManager:
-    def __init__(self, max_concurrent=350):
+    def __init__(self, max_concurrent=500):
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.active_processes = set()
-        self.buffer_size = 65535
-        self.ping_timeout = 0.5  # 타임아웃 시간 감소
+        self.ping_timeout = 0.5
         self.executor = ThreadPoolExecutor(max_workers=max_concurrent)
 
     async def execute_ping(self, ip: str) -> Tuple[bool, float]:
         async with self.semaphore:
+            # ICMP 전용 라이브러리 사용
+            if USE_ICMPLIB:
+                try:
+                    await asyncio.sleep(random.uniform(0, 0.005))
+                    result = await async_ping(
+                        ip, count=1, timeout=0.5, privileged=False
+                    )
+                    return result.is_alive, result.avg_rtt
+                except Exception as e:
+                    return False, 0.0
+
+            # 기존 코드 백업
             is_darwin = platform.system() == "Darwin"
 
             if is_darwin:
-                cmd = ["ping", "-c", "1", "-W", "500", "-q", ip]  # 타임아웃 500ms
+                cmd = ["ping", "-c", "1", "-W", "500", "-q", ip]
             else:
-                cmd = ["ping", "-c", "1", "-w", "0.5", "-q", ip]  # 타임아웃 0.5초
+                cmd = ["ping", "-c", "1", "-w", "0.5", "-q", ip]
 
             try:
+                await asyncio.sleep(random.uniform(0, 0.005))
+
                 start_time = time.monotonic()
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
-                    preexec_fn=os.setsid,
+                    preexec_fn=os.setsid if not is_darwin else None,
                 )
                 self.active_processes.add(proc)
 
                 try:
-                    stdout, _ = await asyncio.wait_for(
-                        proc.communicate(), timeout=0.6
-                    )  # 약간 더 긴 타임아웃
+                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=0.6)
                     elapsed = time.monotonic() - start_time
                     if proc.returncode == 0:
                         try:
@@ -106,26 +159,50 @@ class ProcessManager:
                 finally:
                     if proc in self.active_processes:
                         self.active_processes.remove(proc)
-                        try:
-                            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                        except ProcessLookupError:
-                            pass
+                        if not is_darwin:
+                            try:
+                                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                            except ProcessLookupError:
+                                pass
+                        else:
+                            try:
+                                proc.kill()
+                            except ProcessLookupError:
+                                pass
             except Exception as e:
-                print(f"Error pinging {ip}: {e}")
                 return False, 0.0
+
+    async def check_service(self, host: str, port: int, timeout: float = 0.5) -> bool:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=timeout
+            )
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (asyncio.TimeoutError, ConnectionRefusedError, OSError):
+            return False
 
     async def cleanup(self):
         for proc in list(self.active_processes):
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
+            is_darwin = platform.system() == "Darwin"
+            if not is_darwin:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+
         self.active_processes.clear()
         self.executor.shutdown(wait=False)
 
 
 class ResultProcessor:
-    def __init__(self, cache_size=1000):
+    def __init__(self, cache_size=3000):
         self.cache = LRUCache(cache_size)
         self.last_results = {}
         self.statistics: DefaultDict[str, Dict] = defaultdict(
@@ -153,7 +230,7 @@ class ResultProcessor:
 
 class MemoryOptimizer:
     def __init__(self):
-        self.gc_interval = 10
+        self.gc_interval = 20
         self.iteration = 0
         gc.disable()
 
@@ -168,11 +245,15 @@ class MemoryOptimizer:
 
 def optimize_system_settings():
     try:
-        # 파일 디스크립터 및 프로세스 제한 증가
-        resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
-        resource.setrlimit(resource.RLIMIT_NPROC, (4096, 4096))
+        is_darwin = platform.system() == "Darwin"
 
-        if platform.system() != "Darwin":
+        if is_darwin:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (10240, 10240))
+        else:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (65535, 65535))
+            resource.setrlimit(resource.RLIMIT_NPROC, (4096, 4096))
+
+        if not is_darwin:
             settings = [
                 "net.ipv4.tcp_tw_reuse=1",
                 "net.ipv4.tcp_fin_timeout=15",
@@ -191,21 +272,16 @@ def optimize_system_settings():
             for setting in settings:
                 os.system(f"sysctl -w {setting} > /dev/null 2>&1")
 
-            try:
-                # 실시간 스케줄링 우선순위 설정
-                param = os.sched_param(os.SCHED_RR, 50)
-                os.sched_setscheduler(0, os.SCHED_RR, param)
-            except Exception:
-                pass
+            # 리눅스 전용 설정 생략
+            pass
 
-        # 프로세스 우선순위 설정
         try:
             os.nice(-10)
         except Exception:
             pass
 
-    except Exception as e:
-        print(f"Warning: System optimization failed: {e}")
+    except Exception:
+        pass
 
 
 class PingMonitor:
@@ -223,12 +299,17 @@ class PingMonitor:
         self.results_cache: Dict[str, deque] = {}
         self.max_history_entries = 100
         self.changed_hosts: Set[str] = set()
+        self.last_results: Dict[str, List[PingResult]] = {}
+        self.screen_update_counter = 0
 
-        # 최적화된 컴포넌트들
-        self.process_manager = ProcessManager(max_concurrent=350)
-        self.result_processor = ResultProcessor(cache_size=1000)
+        # M2 맥북에 맞춰 최적화된 컴포넌트들
+        self.process_manager = ProcessManager(max_concurrent=500)
+        self.result_processor = ResultProcessor(cache_size=3000)
         self.memory_optimizer = MemoryOptimizer()
-        self.executor = ThreadPoolExecutor(max_workers=4)
+        cpu_count = os.cpu_count()
+        self.executor = ThreadPoolExecutor(
+            max_workers=16 if cpu_count is None else min(32, cpu_count * 2)
+        )
 
     async def clear_screen(self):
         loop = asyncio.get_running_loop()
@@ -268,7 +349,7 @@ class PingMonitor:
                 self.groups[group] = self.sort_ip_addresses(self.groups[group])
 
         except FileNotFoundError:
-            print(f"Error: {self.filename} 파일을 찾을 수 없습니다.")
+            print(f"오류: {self.filename} 파일을 찾을 수 없습니다.")
             sys.exit(1)
 
     def initialize_host_status(self, host: str) -> None:
@@ -282,11 +363,15 @@ class PingMonitor:
         self.results_cache[host] = deque(maxlen=self.max_history_entries)
 
     async def ping_server(self, ip: str) -> PingResult:
+        await asyncio.sleep(random.uniform(0, 0.005))
         success, response_time = await self.process_manager.execute_ping(ip)
         result = PingResult(ip, success, response_time, datetime.datetime.now())
         self.update_host_status(result)
         self.result_processor.process_result(result)
         return result
+
+    async def check_tcp_service(self, host: str, port: int) -> bool:
+        return await self.process_manager.check_service(host, port)
 
     def update_host_status(self, result: PingResult) -> None:
         host = result.host
@@ -303,7 +388,6 @@ class PingMonitor:
                 self.update_failure_status(host, result.timestamp)
                 self.changed_hosts.add(host)
         else:
-            # 성공할 때마다 실패 카운터 초기화
             self.consecutive_failures[host] = 0
             self.consecutive_successes[host] += 1
 
@@ -336,10 +420,18 @@ class PingMonitor:
         return await asyncio.gather(*tasks)
 
     async def ping_all_groups(self) -> Dict[str, List[PingResult]]:
+        batch_size = self.settings.batch_size
         group_results = {}
+
         for group_name, hosts in self.groups.items():
-            results = await self.ping_batch(hosts)
+            results = []
+            for i in range(0, len(hosts), batch_size):
+                batch = hosts[i : i + batch_size]
+                batch_results = await self.ping_batch(batch)
+                results.extend(batch_results)
+                await asyncio.sleep(0.001)
             group_results[group_name] = results
+
         return group_results
 
     def format_time(self, dt: Optional[datetime.datetime]) -> str:
@@ -450,36 +542,33 @@ class PingMonitor:
     async def monitor_all_groups(self):
         try:
             last_update_time = time.monotonic()
-            screen_update_counter = 0
 
             while self.running:
                 current_time = time.monotonic()
                 elapsed = current_time - last_update_time
 
                 if elapsed < self.settings.interval:
-                    await asyncio.sleep(0.1)  # 짧은 간격으로 체크
+                    await asyncio.sleep(0.1)
                     continue
 
                 try:
                     group_results = await self.ping_all_groups()
 
                     # 화면 업데이트 최적화 (5회마다 화면 지우기)
-                    screen_update_counter += 1
-                    if screen_update_counter >= 5:
+                    self.screen_update_counter += 1
+                    if self.screen_update_counter >= 5:
                         await self.clear_screen()
-                        screen_update_counter = 0
+                        self.screen_update_counter = 0
 
                     formatted_results = await self.format_results(group_results)
-                    print(
-                        "\033[2J\033[H" + formatted_results
-                    )  # ANSI 이스케이프 코드 사용
+                    print("\033[2J\033[H" + formatted_results)
 
                     self.memory_optimizer.optimize()
 
                 except Exception as e:
-                    print(f"Error during monitoring: {e}")
+                    print(f"모니터링 중 오류 발생: {e}")
 
-                last_update_time = current_time  # 실제 실행 완료 시간 기준으로 업데이트
+                last_update_time = current_time
 
         except asyncio.CancelledError:
             self.running = False
@@ -488,7 +577,6 @@ class PingMonitor:
             await self.cleanup()
 
     async def cleanup(self):
-        """리소스 정리"""
         await self.process_manager.cleanup()
         self.executor.shutdown(wait=False)
         for host in self.results_cache:
@@ -516,13 +604,17 @@ def get_monitor_settings() -> MonitorSettings:
                 print("복구 판단 기준 횟수는 1회에서 10회 사이여야 합니다.")
                 continue
 
-            return MonitorSettings(interval, failure_threshold, recovery_threshold)
+            return MonitorSettings(
+                interval=interval,
+                failure_threshold=failure_threshold,
+                recovery_threshold=recovery_threshold,
+            )
 
         except ValueError:
             print("올바른 숫자를 입력해주세요.")
 
 
-async def main():
+def main():
     try:
         # 시스템 설정 최적화
         optimize_system_settings()
@@ -530,12 +622,29 @@ async def main():
         # 모니터링 설정 입력 받기
         settings = get_monitor_settings()
 
-        # PingMonitor 인스턴스 생성 및 실행
+        # 모니터 생성
         monitor = PingMonitor("target_ip.txt", settings)
         monitor.read_groups()
 
-        # 모니터링 시작
-        await monitor.monitor_all_groups()
+        # 이벤트 루프 생성 및 설정 (Python 3.10+ 호환성)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        try:
+            # 모니터링 실행
+            loop.run_until_complete(monitor.monitor_all_groups())
+        except KeyboardInterrupt:
+            print("\n프로그램을 종료합니다.")
+        except Exception as e:
+            print(f"\n오류가 발생했습니다: {e}")
+        finally:
+            try:
+                # 비동기 생성기 종료 및 루프 닫기
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except:
+                pass
+            finally:
+                loop.close()
 
     except KeyboardInterrupt:
         print("\n프로그램을 종료합니다.")
@@ -545,11 +654,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        import uvloop
-
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except ImportError:
-        pass
-
-    asyncio.run(main())  # 이 줄을 추가
+    main()
